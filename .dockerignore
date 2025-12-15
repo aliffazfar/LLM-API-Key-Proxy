@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.eggs
+*.egg-info
+.installed.cfg
+*.egg
+venv/
+.venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local data (will be mounted as volumes)
+key_usage.json
+logs/
+oauth_creds/
+cache/
+
+# Documentation
+*.md
+!README.md
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Local environment files (will be added via Dokploy)
+.env
+.env.*
+!.env.example
+
+# GitHub
+.github/
