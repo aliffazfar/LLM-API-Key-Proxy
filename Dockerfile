@@ -5,19 +5,26 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the application code
+# Copy the entire application code first
 COPY . .
 
-# Install the local rotator_library package
-RUN pip install -e src/rotator_library
+# Install Python dependencies (excluding the local editable package)
+# Then install the local rotator_library package
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    python-dotenv \
+    litellm \
+    filelock \
+    httpx \
+    aiofiles \
+    aiohttp \
+    colorlog \
+    rich \
+    && pip install -e src/rotator_library
 
 # Create directories for persistent data
 RUN mkdir -p /app/logs /app/oauth_creds /app/cache
