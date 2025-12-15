@@ -556,7 +556,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             headers = {
                 "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
                 "Content-Type": "application/json",
-                "Accept": "text/event-stream",
+                # NOTE: iFlow API returns 406 with "Accept: text/event-stream"
+                # Must use application/json even for streaming responses
+                "Accept": "application/json",
                 "User-Agent": "iFlow-Cli",
             }
 
