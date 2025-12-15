@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  llm-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-api-key-proxy
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist usage data, logs, and OAuth credentials
+      - ./data/key_usage.json:/app/key_usage.json
+      - ./data/logs:/app/logs
+      - ./data/oauth_creds:/app/oauth_creds
+      - ./data/cache:/app/cache
+    environment:
+      # === REQUIRED ===
+      # Your proxy authentication key (create a strong secret)
+      - PROXY_API_KEY=${PROXY_API_KEY}
+      
+      # === PROVIDER API KEYS ===
+      # Add your provider API keys below. Format: PROVIDER_API_KEY_N
+      # Examples:
+      # - GEMINI_API_KEY_1=${GEMINI_API_KEY_1}
+      # - GEMINI_API_KEY_2=${GEMINI_API_KEY_2}
+      # - OPENROUTER_API_KEY_1=${OPENROUTER_API_KEY_1}
+      # - OPENAI_API_KEY_1=${OPENAI_API_KEY_1}
+      # - ANTHROPIC_API_KEY_1=${ANTHROPIC_API_KEY_1}
+      
+      # === OAUTH CREDENTIALS (Stateless Mode) ===
+      # For Antigravity OAuth:
+      # - ANTIGRAVITY_ACCESS_TOKEN=${ANTIGRAVITY_ACCESS_TOKEN}
+      # - ANTIGRAVITY_REFRESH_TOKEN=${ANTIGRAVITY_REFRESH_TOKEN}
+      # - ANTIGRAVITY_EXPIRY_DATE=${ANTIGRAVITY_EXPIRY_DATE}
+      # - ANTIGRAVITY_EMAIL=${ANTIGRAVITY_EMAIL}
+      
+      # For Gemini CLI OAuth:
+      # - GEMINI_CLI_ACCESS_TOKEN=${GEMINI_CLI_ACCESS_TOKEN}
+      # - GEMINI_CLI_REFRESH_TOKEN=${GEMINI_CLI_REFRESH_TOKEN}
+      # - GEMINI_CLI_EXPIRY_DATE=${GEMINI_CLI_EXPIRY_DATE}
+      # - GEMINI_CLI_EMAIL=${GEMINI_CLI_EMAIL}
+      
+      # === OPTIONAL SETTINGS ===
+      # Skip OAuth initialization check (set to true for stateless deployment)
+      - SKIP_OAUTH_INIT_CHECK=${SKIP_OAUTH_INIT_CHECK:-false}
+      
+      # Model filtering (comma-separated)
+      # - IGNORE_MODELS_GEMINI=${IGNORE_MODELS_GEMINI}
+      # - WHITELIST_MODELS_GEMINI=${WHITELIST_MODELS_GEMINI}
+      
+      # Concurrency limits per provider
+      # - MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI=${MAX_CONCURRENT_REQUESTS_PER_KEY_GEMINI:-5}
+      
+      # Rotation mode (balanced or sequential)
+      # - ROTATION_MODE_ANTIGRAVITY=${ROTATION_MODE_ANTIGRAVITY:-sequential}
+      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
