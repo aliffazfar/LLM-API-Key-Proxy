@@ -348,18 +348,18 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
             }
-            # Then yield the usage chunk
+            # Then yield the usage chunk with litellm.Usage object
             yield {
                 "choices": [],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
+                "usage": litellm.Usage(
+                    prompt_tokens=usage_data.get("prompt_tokens", 0),
+                    completion_tokens=usage_data.get("completion_tokens", 0),
+                    total_tokens=usage_data.get("total_tokens", 0),
+                ),
             }
             return
 
@@ -371,11 +371,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": {
-                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
-                    "completion_tokens": usage_data.get("completion_tokens", 0),
-                    "total_tokens": usage_data.get("total_tokens", 0),
-                },
+                "usage": litellm.Usage(
+                    prompt_tokens=usage_data.get("prompt_tokens", 0),
+                    completion_tokens=usage_data.get("completion_tokens", 0),
+                    total_tokens=usage_data.get("total_tokens", 0),
+                ),
             }
             return
 
@@ -562,6 +562,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 "User-Agent": "iFlow-Cli",
             }
 
+
             url = f"{api_base.rstrip('/')}/chat/completions"
 
             # Log request to dedicated file
@@ -637,13 +638,15 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 data_str = line[5:]  # Skip "data:"
 
                             if data_str.strip() == "[DONE]":
+                                lib_logger.debug("iFlow stream: received [DONE]")
                                 break
                             try:
                                 chunk = json.loads(data_str)
                                 for openai_chunk in self._convert_chunk_to_openai(
                                     chunk, model
                                 ):
-                                    yield litellm.ModelResponse(**openai_chunk)
+                                    model_response = litellm.ModelResponse(**openai_chunk, stream=True)
+                                    yield model_response
                             except json.JSONDecodeError:
                                 lib_logger.warning(
                                     f"Could not decode JSON from iFlow: {line}"
@@ -662,7 +665,8 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             """Wraps the stream to log the final reassembled response."""
             openai_chunks = []
             try:
-                async for chunk in stream_handler(await make_request()):
+                request_stream = await make_request()
+                async for chunk in stream_handler(request_stream):
                     openai_chunks.append(chunk)
                     yield chunk
             finally:
