@@ -11,10 +11,7 @@ services:
       - "8000:8000"
     volumes:
       # Persist usage data, logs, and OAuth credentials
-      - ./data/key_usage.json:/app/key_usage.json
-      - ./data/logs:/app/logs
-      - ./data/oauth_creds:/app/oauth_creds
-      - ./data/cache:/app/cache
+      - llm-proxy-data:/app/data
     environment:
       # === REQUIRED ===
       # Your proxy authentication key (create a strong secret)
@@ -44,7 +41,7 @@ services:
       
       # === OPTIONAL SETTINGS ===
       # Skip OAuth initialization check (set to true for stateless deployment)
-      - SKIP_OAUTH_INIT_CHECK=${SKIP_OAUTH_INIT_CHECK:-false}
+      - SKIP_OAUTH_INIT_CHECK=${SKIP_OAUTH_INIT_CHECK:-true}
       
       # Model filtering (comma-separated)
       # - IGNORE_MODELS_GEMINI=${IGNORE_MODELS_GEMINI}
@@ -55,10 +52,21 @@ services:
       
       # Rotation mode (balanced or sequential)
       # - ROTATION_MODE_ANTIGRAVITY=${ROTATION_MODE_ANTIGRAVITY:-sequential}
+
+    # Resource limits for Oracle E2.1.Micro (1GB RAM)
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+        reservations:
+          memory: 256M
       
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-      interval: 30s
+      interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 120s
+
+volumes:
+  llm-proxy-data:
