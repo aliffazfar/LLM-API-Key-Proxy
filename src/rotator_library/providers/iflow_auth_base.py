@@ -829,10 +829,10 @@ class IFlowAuthBase:
         - API Key: credential_identifier is the API key string itself
         """
         # Detect credential type
-        if os.path.isfile(credential_identifier):
-            # OAuth credential: file path to JSON
+        if os.path.isfile(credential_identifier) or credential_identifier.startswith("env://"):
+            # OAuth credential: file path to JSON OR virtual env:// path
             lib_logger.debug(
-                f"Using OAuth credentials from file: {credential_identifier}"
+                f"Using OAuth credentials from: {credential_identifier}"
             )
             creds = await self._load_credentials(credential_identifier)
 
