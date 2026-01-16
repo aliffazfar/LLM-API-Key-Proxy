@@ -11,7 +11,7 @@ from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
 from ..model_definitions import ModelDefinitions
 from ..timeout_config import TimeoutConfig
-from ..utils.paths import get_logs_dir
+from ..transaction_logger import ProviderLogger
 import litellm
 from litellm.exceptions import RateLimitError, AuthenticationError
 from pathlib import Path
@@ -21,90 +21,21 @@ from datetime import datetime
 lib_logger = logging.getLogger("rotator_library")
 
 
-def _get_iflow_logs_dir() -> Path:
-    """Get the iFlow logs directory."""
-    logs_dir = get_logs_dir() / "iflow_logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir
-
-
-class _IFlowFileLogger:
-    """A simple file logger for a single iFlow transaction."""
-
-    def __init__(self, model_name: str, enabled: bool = True):
-        self.enabled = enabled
-        if not self.enabled:
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        request_id = str(uuid.uuid4())
-        # Sanitize model name for directory
-        safe_model_name = model_name.replace("/", "_").replace(":", "_")
-        self.log_dir = (
-            _get_iflow_logs_dir() / f"{timestamp}_{safe_model_name}_{request_id}"
-        )
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            lib_logger.error(f"Failed to create iFlow log directory: {e}")
-            self.enabled = False
-
-    def log_request(self, payload: Dict[str, Any]):
-        """Logs the request payload sent to iFlow."""
-        if not self.enabled:
-            return
-        try:
-            with open(
-                self.log_dir / "request_payload.json", "w", encoding="utf-8"
-            ) as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write request: {e}")
-
-    def log_response_chunk(self, chunk: str):
-        """Logs a raw chunk from the iFlow response stream."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "response_stream.log", "a", encoding="utf-8") as f:
-                f.write(chunk + "\n")
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write response chunk: {e}")
-
-    def log_error(self, error_message: str):
-        """Logs an error message."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "error.log", "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.utcnow().isoformat()}] {error_message}\n")
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write error: {e}")
-
-    def log_final_response(self, response_data: Dict[str, Any]):
-        """Logs the final, reassembled response."""
-        if not self.enabled:
-            return
-        try:
-            with open(self.log_dir / "final_response.json", "w", encoding="utf-8") as f:
-                json.dump(response_data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            lib_logger.error(f"_IFlowFileLogger: Failed to write final response: {e}")
-
-
 # Model list can be expanded as iFlow supports more models
 HARDCODED_MODELS = [
     "glm-4.6",
+    "minimax-m2",
     "qwen3-coder-plus",
+    "kimi-k2",
     "kimi-k2-0905",
+    "kimi-k2-thinking",
     "qwen3-max",
     "qwen3-235b-a22b-thinking-2507",
-    "qwen3-coder",
-    "kimi-k2",
+    "deepseek-v3.2-chat",
     "deepseek-v3.2",
     "deepseek-v3.1",
-    "deepseek-r1",
     "deepseek-v3",
+    "deepseek-r1",
     "qwen3-vl-plus",
     "qwen3-235b-a22b-instruct",
     "qwen3-235b",
@@ -348,18 +279,18 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
             }
-            # Then yield the usage chunk with litellm.Usage object
+            # Then yield the usage chunk
             yield {
                 "choices": [],
                 "model": model_id,
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": litellm.Usage(
-                    prompt_tokens=usage_data.get("prompt_tokens", 0),
-                    completion_tokens=usage_data.get("completion_tokens", 0),
-                    total_tokens=usage_data.get("total_tokens", 0),
-                ),
+                "usage": {
+                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                },
             }
             return
 
@@ -371,11 +302,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 "object": "chat.completion.chunk",
                 "id": chunk.get("id", f"chatcmpl-iflow-{time.time()}"),
                 "created": chunk.get("created", int(time.time())),
-                "usage": litellm.Usage(
-                    prompt_tokens=usage_data.get("prompt_tokens", 0),
-                    completion_tokens=usage_data.get("completion_tokens", 0),
-                    total_tokens=usage_data.get("total_tokens", 0),
-                ),
+                "usage": {
+                    "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                    "completion_tokens": usage_data.get("completion_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                },
             }
             return
 
@@ -535,11 +466,11 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         self, client: httpx.AsyncClient, **kwargs
     ) -> Union[litellm.ModelResponse, AsyncGenerator[litellm.ModelResponse, None]]:
         credential_path = kwargs.pop("credential_identifier")
-        enable_request_logging = kwargs.pop("enable_request_logging", False)
+        transaction_context = kwargs.pop("transaction_context", None)
         model = kwargs["model"]
 
-        # Create dedicated file logger for this request
-        file_logger = _IFlowFileLogger(model_name=model, enabled=enable_request_logging)
+        # Create provider logger from transaction context
+        file_logger = ProviderLogger(transaction_context)
 
         async def make_request():
             """Prepares and makes the actual API call."""
@@ -556,12 +487,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             headers = {
                 "Authorization": f"Bearer {api_key}",  # Uses api_key from user info
                 "Content-Type": "application/json",
-                # NOTE: iFlow API returns 406 with "Accept: text/event-stream"
-                # Must use application/json even for streaming responses
-                "Accept": "application/json",
+                "Accept": "text/event-stream",
                 "User-Agent": "iFlow-Cli",
             }
-
 
             url = f"{api_base.rstrip('/')}/chat/completions"
 
@@ -638,15 +566,13 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                                 data_str = line[5:]  # Skip "data:"
 
                             if data_str.strip() == "[DONE]":
-                                lib_logger.debug("iFlow stream: received [DONE]")
                                 break
                             try:
                                 chunk = json.loads(data_str)
                                 for openai_chunk in self._convert_chunk_to_openai(
                                     chunk, model
                                 ):
-                                    model_response = litellm.ModelResponse(**openai_chunk, stream=True)
-                                    yield model_response
+                                    yield litellm.ModelResponse(**openai_chunk)
                             except json.JSONDecodeError:
                                 lib_logger.warning(
                                     f"Could not decode JSON from iFlow: {line}"
@@ -665,8 +591,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             """Wraps the stream to log the final reassembled response."""
             openai_chunks = []
             try:
-                request_stream = await make_request()
-                async for chunk in stream_handler(request_stream):
+                async for chunk in stream_handler(await make_request()):
                     openai_chunks.append(chunk)
                     yield chunk
             finally:
