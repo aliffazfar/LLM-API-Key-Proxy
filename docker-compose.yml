@@ -10,8 +10,16 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Persist usage data, logs, and OAuth credentials
-      - llm-proxy-data:/app/data
+      # Mount .env files for configuration
+      - ./.env:/app/.env:ro
+      # Mount oauth_creds directory for OAuth credentials persistence
+      - ./oauth_creds:/app/oauth_creds
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      # Mount usage directory for usage statistics persistence
+      - ./usage:/app/usage
+      # Optionally mount additional .env files (e.g., combined credential files)
+      # - ./antigravity_all_combined.env:/app/antigravity_all_combined.env:ro
     environment:
       # === REQUIRED ===
       # Your proxy authentication key (create a strong secret)
@@ -67,6 +75,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
-
-volumes:
-  llm-proxy-data:

@@ -1,4 +1,27 @@
-FROM python:3.11-slim
+# Build stage
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set PATH for user-installed packages in builder stage
+ENV PATH=/root/.local/bin:$PATH
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Copy the local rotator_library for editable install
+COPY src/rotator_library ./src/rotator_library
+
+# Install dependencies
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Production stage
+FROM python:3.12-slim
 
 WORKDIR /app
 

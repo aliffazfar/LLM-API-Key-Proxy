@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/providers/antigravity_provider_v2.py
 """
 Antigravity Provider - Refactored Implementation
@@ -26,6 +29,7 @@ import os
 import random
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -56,6 +60,9 @@ from .utilities.gemini_shared_utils import (
     GEMINI3_TOOL_RENAMES_REVERSE,
     FINISH_REASON_MAP,
     DEFAULT_SAFETY_SETTINGS,
+    # Tier utilities
+    TIER_PRIORITIES,
+    DEFAULT_TIER_PRIORITY,
 )
 from ..transaction_logger import AntigravityProviderLogger
 from .utilities.gemini_tool_handler import GeminiToolHandler
@@ -66,7 +73,7 @@ from ..error_handler import EmptyResponseError, TransientQuotaError
 from ..utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
-    from ..usage_manager import UsageManager
+    from ..usage import UsageManager
 
 
 # =============================================================================
@@ -110,8 +117,9 @@ BASE_URLS = [
 # Required headers for Antigravity API calls
 # These headers are CRITICAL for gemini-3-pro-high/low to work
 # Without X-Goog-Api-Client and Client-Metadata, only gemini-3-pro-preview works
+# User-Agent matches official Antigravity Electron client
 ANTIGRAVITY_HEADERS = {
-    "User-Agent": "antigravity/1.12.4 windows/amd64",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
     "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
     "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 }
@@ -162,6 +170,36 @@ EMPTY_RESPONSE_RETRY_DELAY = env_int("ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY", 3
 # inject corrective messages and retry up to this many times
 MALFORMED_CALL_MAX_RETRIES = max(1, env_int("ANTIGRAVITY_MALFORMED_CALL_RETRIES", 2))
 MALFORMED_CALL_RETRY_DELAY = env_int("ANTIGRAVITY_MALFORMED_CALL_DELAY", 1)
+
+# 503 MODEL_CAPACITY_EXHAUSTED retry configuration
+# When server returns 503 (capacity exhausted), retry with longer delay
+# since rotating credentials is pointless - all credentials are equally affected
+CAPACITY_EXHAUSTED_MAX_ATTEMPTS = max(1, env_int("ANTIGRAVITY_503_MAX_ATTEMPTS", 10))
+CAPACITY_EXHAUSTED_RETRY_DELAY = env_int("ANTIGRAVITY_503_RETRY_DELAY", 5)
+
+# =============================================================================
+# INTERNAL RETRY COUNTING (for usage tracking)
+# =============================================================================
+# Tracks the number of API attempts made per request, including internal retries
+# for empty responses, bare 429s, and malformed function calls.
+#
+# Uses ContextVar for thread-safety: each async task (request) gets its own
+# isolated value, so concurrent requests don't interfere with each other.
+#
+# The count is:
+# - Reset to 1 at the start of _streaming_with_retry
+# - Incremented each time we retry (before the next attempt)
+# - Read by on_request_complete() hook to report actual API call count
+#
+# Example: Request gets bare 429 twice, then succeeds
+#   Attempt 1: bare 429 → count stays 1, increment to 2, retry
+#   Attempt 2: bare 429 → count is 2, increment to 3, retry
+#   Attempt 3: success → count is 3
+#   on_request_complete returns count_override=3
+#
+_internal_attempt_count: ContextVar[int] = ContextVar(
+    "antigravity_attempt_count", default=1
+)
 
 # System instruction configuration
 # When true (default), prepend the Antigravity agent system instruction (identity, tool_calling, etc.)
@@ -315,7 +353,30 @@ If you are unsure about a tool's parameters, YOU MUST read the schema definition
 """
 
 # Parallel tool usage encouragement instruction
-DEFAULT_PARALLEL_TOOL_INSTRUCTION = """When multiple independent operations are needed, prefer making parallel tool calls in a single response rather than sequential calls across multiple responses. This reduces round-trips and improves efficiency. Only use sequential calls when one tool's output is required as input for another."""
+DEFAULT_PARALLEL_TOOL_INSTRUCTION = """<instructions name="parallel tool calling">
+
+Using parallel tool calling is MANDATORY. Be proactive about it. DO NO WAIT for the user to request "parallel calls"
+
+PARALLEL CALLS SHOULD BE AND _IS THE PRIMARY WAY YOU USE TOOLS IN THIS ENVIRONMENT_
+
+When you have to perform multi-step operations such as read multiple files, spawn task subagents, bash commands, multiple edits... _THE USER WANTS YOU TO MAKE PARALLEL TOOL CALLS_ instead of separate sequential calls. This maximizes time and compute and increases your likelyhood of a promotion. Sequential tool calling is only encouraged when relying on the output of a call for the next one(s)
+
+- WHAT CAN BE DONE IN PARALLEL, MUST BE, AND WILL BE DONE IN PARALLEL
+- INDIVIDUAL TOOL CALLS TO GATHER CONTEXT IS HEAVILY DISCOURAGED (please make parallel calls!)
+- PARALLEL TOOL CALLING IS YOUR BEST FRIEND AND WILL INCREASE USER'S HAPPINESS
+
+- Make parallel tool calls to manage ressources more efficiently, plan your tool calls ahead, then execute them in parallel.
+- Make parallel calls PROPERLY, be mindful of dependencies between calls.
+
+When researching anything, IT IS BETTER TO READ SPECULATIVELY, THEN TO READ SEQUENTIALLY. For example, if you need to read multiple files to gather context, read them all in parallel instead of reading one, then the next, etc.
+
+This environment has a powerful tool to remove unnecessary context, so you can always read more than needed and then trim down later, no need to use limit and offset parameters on the read tool.
+
+When making code changes, IT IS BETTER TO MAKE MULTIPLE EDITS IN PARALLEL RATHER THAN ONE AT A TIME.
+
+Do as much as you can in parallel, be efficient with you API requests, no single tool call spam, this is crucial as the user pays PER API request, so make them count!
+
+</instructions>"""
 
 # Interleaved thinking support for Claude models
 # Allows Claude to think between tool calls and after receiving tool results
@@ -722,13 +783,14 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
     - Removes unsupported validation keywords at schema-definition level
     - Preserves property NAMES even if they match validation keyword names
       (e.g., a tool parameter named "pattern" is preserved)
-    - For Gemini: passes through most keywords including $schema, anyOf, oneOf, const
+    - Always strips: $schema, $id, $ref, $defs, definitions, default, examples, title
+    - Always converts: const → enum (API doesn't support const)
+    - For Gemini: passes through anyOf, oneOf, allOf (API converts internally)
     - For Claude:
       - Merges allOf schemas into a single schema
       - Flattens anyOf/oneOf using scoring (object > array > primitive > null)
       - Detects enum patterns in unions and merges them
-      - Converts const to enum
-      - Strips unsupported validation keywords
+      - Strips additional validation keywords (minItems, pattern, format, etc.)
     - For Gemini: passes through additionalProperties as-is
     - For Claude: normalizes permissive additionalProperties to true
     """
@@ -737,50 +799,81 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
 
     # Meta/structural keywords - always remove regardless of context
     # These are JSON Schema infrastructure, never valid property names
+    # Note: 'parameters' key rejects these (unlike 'parametersJsonSchema')
     meta_keywords = {
         "$id",
         "$ref",
         "$defs",
+        "$schema",
+        "$comment",
+        "$vocabulary",
+        "$dynamicRef",
+        "$dynamicAnchor",
         "definitions",
+        "default",  # Rejected by 'parameters' key, sometimes
+        "examples",  # Rejected by 'parameters' key, sometimes
+        "title",  # May cause issues in nested objects
     }
 
-    # Validation keywords - only remove at schema-definition level,
-    # NOT when they appear as property names under "properties"
-    # Note: These are common property names that could be used by tools:
+    # Validation keywords to strip ONLY for Claude (Gemini accepts these)
+    # These are common property names that could be used by tools:
     # - "pattern" (glob, grep, regex tools)
     # - "format" (export, date/time tools)
-    # - "default" (config tools)
-    # - "title" (document tools)
     # - "minimum"/"maximum" (range tools)
     #
-    # Keywords to strip for Claude only (Gemini accepts these):
-    # Claude rejects most JSON Schema validation keywords
+    # Keywords to strip for Claude only (Gemini with 'parametersJsonSchema' accepts these,
+    # but we now use 'parameters' key which may silently ignore some):
+    # Note: $schema, default, examples, title moved to meta_keywords (always stripped)
     validation_keywords_claude_only = {
-        "$schema",
+        # Array validation - Gemini accepts
         "minItems",
         "maxItems",
-        "uniqueItems",
+        # String validation - Gemini accepts
         "pattern",
         "minLength",
         "maxLength",
+        "format",
+        # Number validation - Gemini accepts
         "minimum",
         "maximum",
+        # Object validation - Gemini accepts
+        "minProperties",
+        "maxProperties",
+        # Composition - Gemini accepts
+        "not",
+        "prefixItems",
+    }
+
+    # Validation keywords to strip for ALL models (Gemini and Claude)
+    validation_keywords_all_models = {
+        # Number validation - Gemini rejects
         "exclusiveMinimum",
         "exclusiveMaximum",
         "multipleOf",
-        "format",
-        "minProperties",
-        "maxProperties",
+        # Array validation - Gemini rejects
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        # Object validation - Gemini rejects
         "propertyNames",
+        "unevaluatedProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        # Content validation - Gemini rejects
         "contentEncoding",
         "contentMediaType",
         "contentSchema",
+        # Meta annotations - Gemini rejects
+        "examples",
         "deprecated",
         "readOnly",
         "writeOnly",
-        "examples",
-        "title",
-        "default",
+        # Conditional - Gemini rejects
+        "if",
+        "then",
+        "else",
     }
 
     # Handle 'anyOf', 'oneOf', and 'allOf' for Claude
@@ -852,19 +945,30 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 return selected
 
     cleaned = {}
-    # Handle 'const' by converting to 'enum' with single value (Claude only)
-    # Gemini supports const, so pass through for Gemini
-    if "const" in schema and not for_gemini:
+    # Handle 'const' by converting to 'enum' with single value
+    # The 'parameters' key doesn't support 'const', so always convert
+    # Also add 'type' if not present, since enum requires type: "string"
+    if "const" in schema:
         const_value = schema["const"]
         cleaned["enum"] = [const_value]
+        # Gemini requires type when using enum - infer from const value or default to string
+        if "type" not in schema:
+            if isinstance(const_value, bool):
+                cleaned["type"] = "boolean"
+            elif isinstance(const_value, int):
+                cleaned["type"] = "integer"
+            elif isinstance(const_value, float):
+                cleaned["type"] = "number"
+            else:
+                cleaned["type"] = "string"
 
     for key, value in schema.items():
         # Always skip meta keywords
         if key in meta_keywords:
             continue
 
-        # Skip "const" for Claude (already converted to enum above)
-        if key == "const" and not for_gemini:
+        # Skip "const" (already converted to enum above)
+        if key == "const":
             continue
 
         # Strip Claude-only keywords when not targeting Gemini
@@ -873,6 +977,10 @@ def _clean_claude_schema(schema: Any, for_gemini: bool = False) -> Any:
                 # Gemini accepts these - preserve them
                 cleaned[key] = value
             # For Claude: skip - not supported
+            continue
+
+        # Strip keywords unsupported by ALL models (both Gemini and Claude)
+        if key in validation_keywords_all_models:
             continue
 
         # Special handling for additionalProperties:
@@ -972,22 +1080,12 @@ class AntigravityProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_ANTIGRAVITY_*)
     provider_env_name: str = "antigravity"
 
-    # Tier name -> priority mapping (Single Source of Truth)
-    # Lower numbers = higher priority
-    tier_priorities = {
-        # Priority 1: Highest paid tier (Google AI Ultra - name unconfirmed)
-        # "google-ai-ultra": 1,  # Uncomment when tier name is confirmed
-        # Priority 2: Standard paid tier
-        "standard-tier": 2,
-        # Priority 3: Free tier
-        "free-tier": 3,
-        # Priority 10: Legacy/Unknown (lowest)
-        "legacy-tier": 10,
-        "unknown": 10,
-    }
+    # Tier name -> priority mapping (from centralized tier utilities)
+    # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
+    tier_priorities = TIER_PRIORITIES
 
     # Default priority for tiers not in the mapping
-    default_tier_priority: int = 10
+    default_tier_priority: int = DEFAULT_TIER_PRIORITY
 
     # Usage reset configs keyed by priority sets
     # Priorities 1-2 (paid tiers) get 5h window, others get 7d window
@@ -1054,11 +1152,11 @@ class AntigravityProvider(
     # Priority 1 (paid ultra): 5x concurrent requests
     # Priority 2 (standard paid): 3x concurrent requests
     # Others: Use sequential fallback (2x) or balanced default (1x)
-    default_priority_multipliers = {1: 5, 2: 3}
+    default_priority_multipliers = {1: 2, 2: 1}
 
     # For sequential mode, lower priority tiers still get 2x to maintain stickiness
     # For balanced mode, this doesn't apply (falls back to 1x)
-    default_sequential_fallback_multiplier = 2
+    default_sequential_fallback_multiplier = 1
 
     # Custom caps examples (commented - uncomment and modify as needed)
     # default_custom_caps = {
@@ -1447,9 +1545,80 @@ class AntigravityProvider(
         """Clear tool name mapping at start of each request."""
         self._tool_name_mapping.clear()
 
-    def _get_antigravity_headers(self) -> Dict[str, str]:
-        """Return the Antigravity API headers. Used by quota tracker mixin."""
-        return ANTIGRAVITY_HEADERS
+    def _get_credential_email(self, credential_path: str) -> Optional[str]:
+        """
+        Extract email from credential file's _proxy_metadata.
+
+        Args:
+            credential_path: Path to the credential file
+
+        Returns:
+            Email address if found, None otherwise
+        """
+        # Skip env:// paths
+        if self._parse_env_credential_path(credential_path) is not None:
+            return None
+
+        try:
+            # Try to get from cached credentials first
+            if (
+                hasattr(self, "_credentials_cache")
+                and credential_path in self._credentials_cache
+            ):
+                creds = self._credentials_cache[credential_path]
+                return creds.get("_proxy_metadata", {}).get("email")
+
+            # Fall back to reading file
+            with open(credential_path, "r") as f:
+                creds = json.load(f)
+            return creds.get("_proxy_metadata", {}).get("email")
+        except Exception:
+            return None
+
+    def _get_antigravity_headers(
+        self, credential_path: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Return the Antigravity API headers, optionally with device profile.
+
+        If credential_path is provided and has a valid email, builds dynamic
+        Client-Metadata header with device profile for hardware ID binding.
+        Otherwise returns static default headers.
+
+        Args:
+            credential_path: Optional credential path for device profile lookup
+
+        Returns:
+            Dict of HTTP headers for Antigravity API
+        """
+        # Start with static headers (User-Agent, X-Goog-Api-Client)
+        headers = {
+            "User-Agent": ANTIGRAVITY_HEADERS["User-Agent"],
+            "X-Goog-Api-Client": ANTIGRAVITY_HEADERS["X-Goog-Api-Client"],
+        }
+
+        # Try to build dynamic Client-Metadata with device profile
+        if credential_path:
+            email = self._get_credential_email(credential_path)
+            if email:
+                try:
+                    from .utilities.device_profile import (
+                        get_or_create_device_profile,
+                        build_client_metadata_header,
+                    )
+
+                    profile = get_or_create_device_profile(email)
+                    if profile:
+                        headers["Client-Metadata"] = build_client_metadata_header(
+                            profile
+                        )
+                        return headers
+                except Exception as e:
+                    lib_logger.debug(f"Failed to build device profile headers: {e}")
+
+        # Fallback to static Client-Metadata
+        headers["Client-Metadata"] = ANTIGRAVITY_HEADERS["Client-Metadata"]
+        return headers
 
     # NOTE: _load_tier_from_file() is inherited from GeminiCredentialManager mixin
     # NOTE: get_credential_tier_name() is inherited from GeminiCredentialManager mixin
@@ -2741,7 +2910,8 @@ class AntigravityProvider(
         Apply strict schema enforcement to all tools in a list.
 
         Wraps the mixin's _enforce_strict_schema() method to operate on a list of tools,
-        applying 'additionalProperties: false' to each tool's parametersJsonSchema.
+        applying 'additionalProperties: false' to each tool's schema.
+        Supports both 'parametersJsonSchema' and 'parameters' keys.
         """
         if not tools:
             return tools
@@ -2749,11 +2919,14 @@ class AntigravityProvider(
         modified = copy.deepcopy(tools)
         for tool in modified:
             for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    # Delegate to mixin's singular _enforce_strict_schema method
-                    func_decl["parametersJsonSchema"] = self._enforce_strict_schema(
-                        func_decl["parametersJsonSchema"]
-                    )
+                # Support both parametersJsonSchema and parameters keys
+                for schema_key in ("parametersJsonSchema", "parameters"):
+                    if schema_key in func_decl:
+                        # Delegate to mixin's singular _enforce_strict_schema method
+                        func_decl[schema_key] = self._enforce_strict_schema(
+                            func_decl[schema_key]
+                        )
+                        break  # Only process one schema key per function
 
         return modified
 
@@ -3240,11 +3413,19 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
 
         For Gemini models, all tools are placed in a SINGLE functionDeclarations array.
         This matches the format expected by Gemini CLI and prevents MALFORMED_FUNCTION_CALL errors.
+
+        Uses 'parameters' key for all models. The Antigravity API backend expects this format.
+        Schema cleaning is applied based on target model (Claude vs Gemini).
         """
         if not tools:
             return None
 
         function_declarations = []
+
+        # Always use 'parameters' key - Antigravity API expects this for all models
+        # Previously used 'parametersJsonSchema' but this caused MALFORMED_FUNCTION_CALL
+        # errors with Gemini 3 Pro models. Using 'parameters' works for all backends.
+        schema_key = "parameters"
 
         for tool in tools:
             if tool.get("type") != "function":
@@ -3285,11 +3466,11 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     }
                     schema["required"] = ["_confirm"]
 
-                func_decl["parametersJsonSchema"] = schema
+                func_decl[schema_key] = schema
             else:
                 # No parameters provided - use default with required confirm param
                 # to ensure the tool call is emitted properly
-                func_decl["parametersJsonSchema"] = {
+                func_decl[schema_key] = {
                     "type": "object",
                     "properties": {
                         "_confirm": {
@@ -3531,30 +3712,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 first_func_seen = True
                             # Subsequent parallel calls: leave as-is (no signature)
 
-        # Claude-specific tool schema transformation
-        if internal_model.startswith("claude-sonnet-") or internal_model.startswith(
-            "claude-opus-"
-        ):
-            self._apply_claude_tool_transform(antigravity_payload)
-
         return antigravity_payload
-
-    def _apply_claude_tool_transform(self, payload: Dict[str, Any]) -> None:
-        """Apply Claude-specific tool schema transformations.
-
-        Converts parametersJsonSchema to parameters and applies Claude-specific
-        schema sanitization (inlines $ref, removes unsupported JSON Schema fields).
-        """
-        tools = payload["request"].get("tools", [])
-        for tool in tools:
-            for func_decl in tool.get("functionDeclarations", []):
-                if "parametersJsonSchema" in func_decl:
-                    params = func_decl["parametersJsonSchema"]
-                    if isinstance(params, dict):
-                        params = inline_schema_refs(params)
-                        params = _clean_claude_schema(params)
-                    func_decl["parameters"] = params
-                    del func_decl["parametersJsonSchema"]
 
     # =========================================================================
     # RESPONSE TRANSFORMATION
@@ -3866,7 +4024,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
-                **ANTIGRAVITY_HEADERS,
+                **self._get_antigravity_headers(api_key),
             }
             payload = {
                 "project": _generate_project_id(),
@@ -4109,7 +4267,7 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            **ANTIGRAVITY_HEADERS,
+            **self._get_antigravity_headers(credential_path),
         }
 
         # Keep a mutable reference to gemini_contents for retry injection
@@ -4553,6 +4711,9 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         current_gemini_contents = gemini_contents
         current_payload = payload
 
+        # Reset internal attempt counter for this request (thread-safe via ContextVar)
+        _internal_attempt_count.set(1)
+
         for attempt in range(EMPTY_RESPONSE_MAX_ATTEMPTS):
             chunk_count = 0
 
@@ -4580,6 +4741,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                         f"[Antigravity] Empty stream from {model}, "
                         f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
                     )
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                     continue
                 else:
@@ -4682,6 +4845,8 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                                 malformed_retry_count, current_payload
                             )
 
+                    # Increment attempt count before retry (for usage tracking)
+                    _internal_attempt_count.set(_internal_attempt_count.get() + 1)
                     await asyncio.sleep(MALFORMED_CALL_RETRY_DELAY)
                     continue  # Retry with modified payload
                 else:
@@ -4700,6 +4865,38 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                     return
 
             except httpx.HTTPStatusError as e:
+                # Handle 503 MODEL_CAPACITY_EXHAUSTED - retry internally
+                # since rotating credentials is pointless (affects all equally)
+                if e.response.status_code == 503:
+                    error_body = ""
+                    try:
+                        error_body = (
+                            e.response.text if hasattr(e.response, "text") else ""
+                        )
+                    except Exception:
+                        pass
+
+                    if "MODEL_CAPACITY_EXHAUSTED" in error_body:
+                        if attempt < CAPACITY_EXHAUSTED_MAX_ATTEMPTS - 1:
+                            lib_logger.warning(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED from {model}, "
+                                f"attempt {attempt + 1}/{CAPACITY_EXHAUSTED_MAX_ATTEMPTS}. "
+                                f"Waiting {CAPACITY_EXHAUSTED_RETRY_DELAY}s..."
+                            )
+                            # NOTE: Do NOT increment _internal_attempt_count here - 503 capacity
+                            # exhausted errors don't consume quota, so retries are "free"
+                            await asyncio.sleep(CAPACITY_EXHAUSTED_RETRY_DELAY)
+                            continue
+                        else:
+                            # Max attempts reached - propagate error
+                            lib_logger.warning(
+                                f"[Antigravity] 503 MODEL_CAPACITY_EXHAUSTED after "
+                                f"{CAPACITY_EXHAUSTED_MAX_ATTEMPTS} attempts. Giving up."
+                            )
+                            raise
+                    # Other 503 errors - raise immediately
+                    raise
+
                 if e.response.status_code == 429:
                     # Check if this is a bare 429 (no retry info) vs real quota exhaustion
                     quota_info = self.parse_quota_error(e)
@@ -4709,6 +4906,10 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
                             lib_logger.warning(
                                 f"[Antigravity] Bare 429 from {model}, "
                                 f"attempt {attempt + 1}/{EMPTY_RESPONSE_MAX_ATTEMPTS}. Retrying..."
+                            )
+                            # Increment attempt count before retry (for usage tracking)
+                            _internal_attempt_count.set(
+                                _internal_attempt_count.get() + 1
                             )
                             await asyncio.sleep(EMPTY_RESPONSE_RETRY_DELAY)
                             continue
@@ -4801,3 +5002,51 @@ Analyze what you did wrong, correct it, and retry the function call. Output ONLY
         except Exception as e:
             lib_logger.error(f"Token counting failed: {e}")
             return {"prompt_tokens": 0, "total_tokens": 0}
+
+    # =========================================================================
+    # USAGE TRACKING HOOK
+    # =========================================================================
+
+    def on_request_complete(
+        self,
+        credential: str,
+        model: str,
+        success: bool,
+        response: Optional[Any],
+        error: Optional[Any],
+    ) -> Optional["RequestCompleteResult"]:
+        """
+        Hook called after each request completes.
+
+        Reports the actual number of API calls made, including internal retries
+        for empty responses, bare 429s, and malformed function calls.
+
+        This uses the ContextVar pattern for thread-safe retry counting:
+        - _internal_attempt_count is set to 1 at start of _streaming_with_retry
+        - Incremented before each retry
+        - Read here to report the actual count
+
+        Example: Request gets 2 bare 429s then succeeds
+            → 3 API calls made
+            → Returns count_override=3
+            → Usage manager records 3 requests instead of 1
+
+        Returns:
+            RequestCompleteResult with count_override set to actual attempt count
+        """
+        from ..core.types import RequestCompleteResult
+
+        # Get the attempt count for this request
+        attempt_count = _internal_attempt_count.get()
+
+        # Reset for safety (though ContextVar should isolate per-task)
+        _internal_attempt_count.set(1)
+
+        # Log if we made extra attempts
+        if attempt_count > 1:
+            lib_logger.debug(
+                f"[Antigravity] Request to {model} used {attempt_count} API calls "
+                f"(includes internal retries)"
+            )
+
+        return RequestCompleteResult(count_override=attempt_count)

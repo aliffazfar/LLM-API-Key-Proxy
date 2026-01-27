@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
 # src/rotator_library/utils/resilient_io.py
 """
 Resilient I/O utilities for handling file operations gracefully.
@@ -655,6 +658,36 @@ def safe_log_write(
     except (OSError, PermissionError, IOError) as e:
         logger.warning(f"Failed to write log to {path}: {e}")
         return False
+
+
+def safe_read_json(
+    path: Union[str, Path],
+    logger: logging.Logger,
+    *,
+    parse_json: bool = True,
+) -> Optional[Any]:
+    """
+    Read file contents with error handling.
+
+    Args:
+        path: File path to read from
+        logger: Logger for warnings/errors
+        parse_json: When True, parse JSON; when False, return raw text
+
+    Returns:
+        Parsed JSON dict, raw text, or None on failure
+    """
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if parse_json:
+                return json.load(f)
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, PermissionError, IOError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to read {path}: {e}")
+        return None
 
 
 def safe_mkdir(path: Union[str, Path], logger: logging.Logger) -> bool:
